@@ -30,10 +30,10 @@ var (
 )
 
 const (
-	hdrSize            = 4        // tranx protocol header size
+	hdrSize            = 4        // transaction protocol header size
 	bufferSize         = 1024 * 4 // receive buffer
 	radarServerTimeout = 30       // radar server connection lost timeout
-	heartBeatInterval  = 5        // heart beat check interval
+	heartbeatInterval  = 5        // heartbeat send interval
 	dialTimeout        = 5        // dial radar server timeout
 )
 
@@ -41,7 +41,7 @@ const (
 // App status and event
 /////////////////////////////////////////////////////////////
 
-// AppStatus represent the app's status
+// AppStatus represent the status of an app
 type AppStatus uint8
 
 const (
@@ -64,8 +64,8 @@ func (s AppStatus) String() string {
 	return status2str[s]
 }
 
-// AppStatusArgs is the request args which user should pass into client API
-type AppStatusArgs struct {
+// StatusReq is the request args which user should pass into client API
+type StatusReq struct {
 	DomainMoid   string `json:"domain_moid"`
 	ResourceMoid string `json:"resource_moid"`
 	GroupMoid    string `json:"group_moid"`
@@ -73,19 +73,19 @@ type AppStatusArgs struct {
 	ServerName   string `json:"server_name"`
 }
 
-// AppStatusReply is the reply of client API which request app status
-type AppStatusReply struct {
+// StatusRsp is the reply of client API which request app status
+type StatusRsp struct {
 	ServerMoid string
 	ServerName string
 	Status     AppStatus
 }
 
-// AppStatusEvent is the event which happened
-type AppStatusEvent uint8
+// EventReq is the event which happened
+type EventReq uint8
 
 const (
 	/*
-		wukai defined in radarserver.py:
+		NOTE: the original definition is from radarserver.py
 
 		CREATED_EVENT_DEF = 1
 		DELETED_EVENT_DEF = 2
@@ -93,47 +93,47 @@ const (
 	*/
 
 	// AppStatusEventCreated shows the app has been registered in radar server
-	AppStatusEventCreated = 1
+	AppStatusEventCreated EventReq = 1
 
 	// AppStatusEventDeleted shows the app has been de-registered in radar server
-	AppStatusEventDeleted = 2
+	AppStatusEventDeleted EventReq = 2
 
 	// AppStatusEventChanged shows the app status has been changed
-	AppStatusEventChanged = 3
+	AppStatusEventChanged EventReq = 3
 )
 
-// AppStatusEventReply is one of the args filled by radar watch API, which will
-// be passed into callback
-type AppStatusEventReply struct {
-	event AppStatusEvent
+// EventRsp is returned by radar watch API, which will be passed into callback
+type EventRsp struct {
+	event EventReq
 	data  interface{}
 }
 
-/////////////////////////////////////////////////////////////
-// Transaction
-/////////////////////////////////////////////////////////////
-type tranx struct {
-	key      string
+// mark one-time interaction
+type transaction struct {
+	token    string // unique random string used in sync.Map as key
 	sendData pdata
 
 	// NOTE: fd, 20190109
-	// `watch' operation may got more than one data
+	// watch operation may got more than one data
 	recvDataC chan pdata
 }
 
 /////////////////////////////////////////////////////////////
-// Protocol data struct
+// Protocol definition
 /////////////////////////////////////////////////////////////
-type t uint
+type protoMethod uint
 
+// TODO: 协议扩展位置
 const (
-	tHeartBeat = iota
-	tGetAppStatus
-	tWatchAppStatus
+	heartbeatMethod      protoMethod = 0
+	getAppStatusMethod   protoMethod = 1
+	watchAppStatusMethod protoMethod = 2
+
+	// TODO: add more
 )
 
 type pdata struct {
-	t    t
+	pm   protoMethod
 	data map[string]interface{}
 }
 
@@ -151,61 +151,67 @@ func (d *pdata) decode(data []byte) (*pdata, error) {
 
 	v, ok := buf.(map[string]interface{})
 	if !ok {
-		err = fmt.Errorf("cannot convert [%v] to type map[string]interface{}", buf)
+		err = fmt.Errorf("[radar-client] convert [%v] to map[string]interface{} failed!", buf)
 		return nil, err
 	}
 
+	// FIXME: find no definition of "action"
 	act, ok := v["action"]
 	if !ok {
-		err = fmt.Errorf("no [action] field in data: %v", v)
+		err = fmt.Errorf("[radar-client] no 'action' field in this data(%v)", v)
 		return nil, err
 	}
 
+	// TODO: 协议扩展位置
 	switch act {
 	case "heart_beat":
-		d.t = tHeartBeat
+		d.pm = heartbeatMethod
 	case "get_app_status":
-		d.t = tGetAppStatus
+		d.pm = getAppStatusMethod
 	case "watch":
-		d.t = tWatchAppStatus
+		d.pm = watchAppStatusMethod
 	}
 
 	d.data = v
 	return d, nil
 }
 
-func heartBeatData(key string) pdata {
+func heartBeatData(token string) pdata {
 	return pdata{
-		t: tHeartBeat,
+		pm: heartbeatMethod,
 		data: map[string]interface{}{
-			"key":    key,
-			"action": "heart_beat"},
+			"key":    token,
+			"action": "heart_beat",
+		},
 	}
 }
 
-func getAppStatusData(key string, args []AppStatusArgs) pdata {
+func getAppStatusData(token string, args []StatusReq) pdata {
 	return pdata{
-		t: tGetAppStatus,
+		pm: getAppStatusMethod,
 		data: map[string]interface{}{
-			"key":    key,
+			"key":    token,
 			"action": "get_app_status",
-			"args":   map[string][]AppStatusArgs{"servers": args},
-		}}
+			"args":   map[string][]StatusReq{"servers": args},
+		},
+	}
 }
 
-func watchAppStatusData(key string, args AppStatusArgs) pdata {
+func watchAppStatusData(token string, args StatusReq) pdata {
 	return pdata{
-		t: tWatchAppStatus,
+		pm: watchAppStatusMethod,
 		data: map[string]interface{}{
-			"key":    key,
+			"key":    token,
 			"action": "watch",
 			"args": map[string]string{
 				"domain_moid":   args.DomainMoid,
 				"resource_moid": args.ResourceMoid,
 				"group_moid":    args.GroupMoid,
 				"server_moid":   args.ServerName + "_" + args.ServerMoid,
-				"node":          "status"},
-		}}
+				"node":          "status",
+			},
+		},
+	}
 }
 
 // RadarClient represent a radar client
@@ -213,22 +219,23 @@ type RadarClient struct {
 	host   string
 	client net.Conn
 
-	connected      bool          // is radar server connected
-	radarLostTimer *time.Timer   // timer of radar server connection lost
-	connectedCh    chan struct{} // signal chan of connection established
-	connLostCh     chan struct{} // signal chan of connection lost
+	connected      bool // connection state of radar server
+	radarLostTimer *time.Timer
+
+	connectedCh    chan struct{} // mark establishment of a connection
+	disconnectedCh chan struct{} // mark teardown of a connection
 
 	stopped bool          // is this client stopped?
 	stopCh  chan struct{} // stop signal channel
 
-	tranxs sync.Map // should be a map[string]*tranx
+	smap sync.Map // should be a map[string]*transaction
 
 	logger *logrus.Logger
 
 	sync.Mutex
 }
 
-func (rc *RadarClient) send(t *tranx) error {
+func (rc *RadarClient) send(t *transaction) error {
 	var bytes []byte
 
 	b, err := t.sendData.encode()
@@ -240,11 +247,11 @@ func (rc *RadarClient) send(t *tranx) error {
 	bytes = append(bytes, intToBytes(cnt)...)
 	bytes = append(bytes, b...)
 
-	rc.logger.Debugf("[radar-client] will send data: %s", bytes)
+	rc.logger.Debugf("[radar-client] send => %s", bytes)
 	rc.client.SetWriteDeadline(time.Now().Add(radarServerTimeout * time.Second))
 	_, err = rc.client.Write(bytes)
 	if err != nil {
-		rc.logger.Errorf("[radar-client] data send failed: %v", err)
+		rc.logger.Errorf("[radar-client] send failed: %v", err)
 		return err
 	}
 
@@ -263,15 +270,15 @@ func (rc *RadarClient) receive() {
 		rc.client.SetReadDeadline(time.Now().Add(radarServerTimeout * time.Second))
 		n, err := rc.client.Read(buf)
 		if err != nil {
-			rc.logger.Errorf("[radar-client] receiving failed: %v", err)
+			rc.logger.Errorf("[radar-client] receive failed: %v", err)
 			if err == io.EOF {
 				select {
-				case <-rc.connLostCh:
+				case <-rc.disconnectedCh:
 					return
 				default:
-					close(rc.connLostCh)
-					rc.updateConnStatus(false, "close by the other side")
-					rc.closeConn("close by the other side")
+					close(rc.disconnectedCh)
+					rc.updateConnStatus(false, "connection closed by the other side")
+					rc.closeConn("connection closed by the other side")
 				}
 				return
 			}
@@ -279,7 +286,7 @@ func (rc *RadarClient) receive() {
 			continue
 		}
 
-		rc.logger.Debugf("[radar-client] data received: %s", buf[:n])
+		rc.logger.Debugf("[radar-client] recv <= %s", buf[:n])
 		raw = append(raw, buf[:n]...)
 
 		for len(raw) > hdrSize {
@@ -311,42 +318,43 @@ func (rc *RadarClient) handleData(data []byte) {
 		return
 	}
 
-	switch pdata.t {
-	case tHeartBeat:
+	switch pdata.pm {
+	case heartbeatMethod:
 		// update connection based on heart_beat reply
-		rc.updateConnStatus(true, "heart beat got")
+		rc.updateConnStatus(true, "heartbeat reply confirm")
 
 	default:
-		key, ok := pdata.data["key"].(string)
+		token, ok := pdata.data["key"].(string)
 		if !ok {
-			logrus.Errorf("[radar-client] the key must be a type of string")
+			logrus.Errorf("[radar-client] the key value (for sync.Map) must be of string type")
 			return
 		}
 
-		if v, ok := rc.tranxs.Load(key); ok {
-			v.(*tranx).recvDataC <- pdata
+		if v, ok := rc.smap.Load(token); ok {
+			v.(*transaction).recvDataC <- pdata
 		}
 	}
 }
 
-func (rc *RadarClient) sendHeartBeat() error {
-	var t = &tranx{}
+func (rc *RadarClient) sendHeartbeat() error {
+	var t = &transaction{}
 
-	t.key = randStrGenerator()
-	t.sendData = heartBeatData(t.key)
+	t.token = randStrGenerator()
+	t.sendData = heartBeatData(t.token)
 
 	// NOTE: fd, 20181227
-	// skip init the tranx's err channel, cuz it would not be used
+	// skip init the transaction's err channel, cuz it would not be used
 	// t.c = make(chan error)
 	return rc.send(t)
 }
 
 func (rc *RadarClient) healthCheck() {
-	if err := rc.sendHeartBeat(); err != nil {
-		rc.logger.Errorf("[radar-client] send beat failed: %v", err)
+	// FIXME: really needed?
+	if err := rc.sendHeartbeat(); err != nil {
+		rc.logger.Errorf("[radar-client] heartbeat send failed: %v", err)
 	}
 
-	ticker := time.NewTicker(heartBeatInterval * time.Second)
+	ticker := time.NewTicker(heartbeatInterval * time.Second)
 
 	for {
 		select {
@@ -356,32 +364,32 @@ func (rc *RadarClient) healthCheck() {
 
 		case <-ticker.C:
 			select {
-			case <-rc.connLostCh:
+			case <-rc.disconnectedCh:
 				return
 			default:
-				if err := rc.sendHeartBeat(); err != nil {
-					rc.logger.Errorf("[radar-client] send beat failed: %v", err)
+				if err := rc.sendHeartbeat(); err != nil {
+					rc.logger.Errorf("[radar-client] heartbeat send failed: %v", err)
 				}
 			}
 
 		case <-rc.radarLostTimer.C:
-			// connection lost found
-			// 1. send out connection lost signal
+			// NOTE:
+			// 1. signal the state of disconnection
 			// 2. update connection status
-			// 3. close connection to make sure sync io function `read/send' failed
+			// 3. close connection to make sure sync i/o function `read/send' failed
 			select {
-			case <-rc.connLostCh:
+			case <-rc.disconnectedCh:
 				return
 			default:
-				close(rc.connLostCh)
-				rc.updateConnStatus(false, "timeout")
-				rc.closeConn("timeout")
+				close(rc.disconnectedCh)
+				rc.updateConnStatus(false, "healthcheck timeout")
+				rc.closeConn("healthcheck timeout")
 			}
 		}
 	}
 }
 
-func (rc *RadarClient) close(reason string) {
+func (rc *RadarClient) disconnect(reason string) {
 	rc.Lock()
 	defer rc.Unlock()
 
@@ -395,53 +403,58 @@ func (rc *RadarClient) close(reason string) {
 
 	close(rc.stopCh)
 
-	rc.logger.Infof("[radar-client] client closed: %v", reason)
+	rc.logger.Infof("[radar-client] connection to radar is [DOWN] (reason: '%s')", reason)
 }
 
-func (rc *RadarClient) updateConnStatus(yes bool, reason string) {
+func (rc *RadarClient) updateConnStatus(stat bool, reason string) {
 	rc.Lock()
 	defer rc.Unlock()
 
-	if !rc.connected && yes {
+	if !rc.connected && stat {
+		// unconnected --> connected
 		close(rc.connectedCh)
 	}
-
-	rc.connected = yes
+	rc.connected = stat
 
 	if rc.connected {
+		// NOTE: the usage below is illustrated inside Stop() function
 		if !rc.radarLostTimer.Stop() {
 			<-rc.radarLostTimer.C
 		}
 		rc.radarLostTimer.Reset(radarServerTimeout * time.Second)
-		rc.logger.Debugf("[radar-client] radar server timer has been reset! on account of: %s", reason)
+		rc.logger.Debugf("[radar-client] connection to radar is [UP] ('%s')", reason)
 	} else {
-		rc.logger.Warnf("[radar-client] radar server disconnected! on account of: %s", reason)
+		rc.logger.Warnf("[radar-client] connection to radar is [DOWN] (reason: '%s')", reason)
 	}
 }
 
 func (rc *RadarClient) closeConn(reason string) error {
-	rc.logger.Debugf("[radar-client] radar client connection will be closed, on account of %s", reason)
+	rc.logger.Debugf("[radar-client] shutdown radar connection locally, as of '%s'", reason)
+
 	if rc.client != nil {
 		return rc.client.Close()
 	}
 	return nil
 }
 
-func (rc *RadarClient) registerTranx(t *tranx) {
-	rc.tranxs.Store(t.key, t)
+func (rc *RadarClient) regTransaction(t *transaction) {
+	rc.smap.Store(t.token, t)
 }
 
-func (rc *RadarClient) deregisterTranx(t *tranx) {
-	rc.tranxs.Delete(t.key)
+func (rc *RadarClient) unregTransaction(t *transaction) {
+	rc.smap.Delete(t.token)
 }
 
 /////////////////////////////////////////////////////////////////////////////
 // USER APIs
 /////////////////////////////////////////////////////////////////////////////
 
-// NewRadarClient returns a inst of radar client data structure
+// NewRadarClient returns a instance of radar client
 func NewRadarClient(host string, logger *logrus.Logger) *RadarClient {
-	return &RadarClient{host: host, logger: logger}
+	return &RadarClient{
+		host:   host,
+		logger: logger,
+	}
 }
 
 // Connect tries to connect with radar server
@@ -451,7 +464,7 @@ func (rc *RadarClient) Connect() error {
 
 	rc.stopCh = make(chan struct{})
 	rc.connectedCh = make(chan struct{})
-	rc.connLostCh = make(chan struct{})
+	rc.disconnectedCh = make(chan struct{})
 
 	c, err := net.DialTimeout("tcp", rc.host, dialTimeout*time.Second)
 	if err != nil {
@@ -462,7 +475,7 @@ func (rc *RadarClient) Connect() error {
 	rc.radarLostTimer = time.NewTimer(radarServerTimeout * time.Second)
 
 	rc.client = c
-	rc.tranxs = sync.Map{}
+	rc.smap = sync.Map{}
 
 	go rc.healthCheck()
 	go rc.receive()
@@ -493,9 +506,9 @@ func (rc *RadarClient) Connected() bool {
 	return rc.connected
 }
 
-// Close the client, together will connection will radar server
-func (rc *RadarClient) Close() {
-	rc.close("user request")
+// Disconnect the client, together will connection will radar server
+func (rc *RadarClient) Disconnect() {
+	rc.disconnect("trigger disconnection from upper call")
 }
 
 // Version returns the current radar client version
@@ -504,7 +517,7 @@ func (rc *RadarClient) Version() string {
 }
 
 // GetAppStatus returns the app status
-func (rc *RadarClient) GetAppStatus(args []AppStatusArgs) ([]AppStatusReply, error) {
+func (rc *RadarClient) GetAppStatus(args []StatusReq) ([]StatusRsp, error) {
 	if !rc.Connected() {
 		return nil, ErrRadarServerLost
 	}
@@ -513,8 +526,8 @@ func (rc *RadarClient) GetAppStatus(args []AppStatusArgs) ([]AppStatusReply, err
 		return nil, ErrRadarClientStopped
 	}
 
-	var t = &tranx{}
-	var reply []AppStatusReply
+	var t = &transaction{}
+	var reply []StatusRsp
 	var result struct {
 		Result struct {
 			Data []struct {
@@ -525,20 +538,20 @@ func (rc *RadarClient) GetAppStatus(args []AppStatusArgs) ([]AppStatusReply, err
 		}
 	}
 
-	var key string
+	var tokenTemp string
 	for {
-		key = randStrGenerator()
-		if _, ok := rc.tranxs.Load(key); ok {
+		tokenTemp = randStrGenerator()
+		if _, ok := rc.smap.Load(tokenTemp); ok {
 			continue
 		}
 		break
 	}
-	t.key = key
-	t.sendData = getAppStatusData(t.key, args)
+	t.token = tokenTemp
+	t.sendData = getAppStatusData(t.token, args)
 	t.recvDataC = make(chan pdata)
 
-	rc.registerTranx(t)
-	defer rc.deregisterTranx(t)
+	rc.regTransaction(t)
+	defer rc.unregTransaction(t)
 
 	err := rc.send(t)
 	if err != nil {
@@ -567,7 +580,7 @@ func (rc *RadarClient) GetAppStatus(args []AppStatusArgs) ([]AppStatusReply, err
 				return reply, fmt.Errorf("cannot parse status: %v", r)
 			}
 
-			reply = append(reply, AppStatusReply{ServerMoid: r.Moid, ServerName: r.Name, Status: s})
+			reply = append(reply, StatusRsp{ServerMoid: r.Moid, ServerName: r.Name, Status: s})
 		}
 
 		return reply, nil
@@ -575,13 +588,13 @@ func (rc *RadarClient) GetAppStatus(args []AppStatusArgs) ([]AppStatusReply, err
 	case <-rc.stopCh:
 		return nil, ErrRadarClientStopped
 
-	case <-rc.connLostCh:
+	case <-rc.disconnectedCh:
 		return nil, ErrRadarServerLost
 	}
 }
 
 // WatchAppStatus watches the specific app status
-func (rc *RadarClient) WatchAppStatus(args AppStatusArgs, f func(rpl AppStatusEventReply, err error)) error {
+func (rc *RadarClient) WatchAppStatus(args StatusReq, cb func(rpl EventRsp, err error)) error {
 	if !rc.Connected() {
 		return ErrRadarServerLost
 	}
@@ -590,20 +603,20 @@ func (rc *RadarClient) WatchAppStatus(args AppStatusArgs, f func(rpl AppStatusEv
 		return ErrRadarClientStopped
 	}
 
-	var t = &tranx{}
-	var key string
+	var t = &transaction{}
+	var tokenTemp string
 	for {
-		key = randStrGenerator()
-		if _, ok := rc.tranxs.Load(key); ok {
+		tokenTemp = randStrGenerator()
+		if _, ok := rc.smap.Load(tokenTemp); ok {
 			continue
 		}
 		break
 	}
-	t.key = key
-	t.sendData = watchAppStatusData(t.key, args)
+	t.token = tokenTemp
+	t.sendData = watchAppStatusData(t.token, args)
 	t.recvDataC = make(chan pdata)
 
-	rc.registerTranx(t)
+	rc.regTransaction(t)
 
 	err := rc.send(t)
 	if err != nil {
@@ -612,10 +625,10 @@ func (rc *RadarClient) WatchAppStatus(args AppStatusArgs, f func(rpl AppStatusEv
 
 	// wait for the reply in another routine
 	go func() {
-		defer rc.deregisterTranx(t)
+		defer rc.unregTransaction(t)
 
 		for !rc.stopped {
-			var rpl AppStatusEventReply
+			var rpl EventRsp
 			var err error
 			var result struct {
 				Result struct {
@@ -630,7 +643,7 @@ func (rc *RadarClient) WatchAppStatus(args AppStatusArgs, f func(rpl AppStatusEv
 				// checkout protocol.md
 				err = mapstructure.Decode(d.data, &result)
 				if err != nil {
-					f(rpl, err)
+					cb(rpl, err)
 					continue
 				}
 
@@ -648,14 +661,14 @@ func (rc *RadarClient) WatchAppStatus(args AppStatusArgs, f func(rpl AppStatusEv
 				}
 
 				rpl.data = result.Result.Data
-				f(rpl, err)
+				cb(rpl, err)
 
 			case <-rc.stopCh:
-				f(rpl, ErrRadarClientStopped)
+				cb(rpl, ErrRadarClientStopped)
 				return
 
-			case <-rc.connLostCh:
-				f(rpl, ErrRadarServerLost)
+			case <-rc.disconnectedCh:
+				cb(rpl, ErrRadarServerLost)
 				return
 			}
 		}

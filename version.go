@@ -1,6 +1,6 @@
 package client
 
 const (
-	VERSION = "unstable"
-	DATE    = "20190122"
+	VERSION = "(moooofly)"
+	DATE    = "20200223"
 )
