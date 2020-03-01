@@ -13,13 +13,31 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-/*var (
-	sync_actions = []string{"get", "set", "get_children", "update", "set_app_status", "get_app_status", "set_app_control",
-		"get_app_control", "set_machine_room_control", "get_machine_room_control", "set_machine_room_status",
-		"get_machine_room_status", "get_app_list", "get_group_list", "get_machine_room_list"}
+var (
+	sync_actions = []string{
+		"get",
+		"set",
+		"get_children",
+		"update",
+		"set_app_status",
+		"get_app_status",
+		"set_app_control",
+		"get_app_control",
+		"set_machine_room_control",
+		"get_machine_room_control",
+		"set_machine_room_status",
+		"get_machine_room_status",
+		"get_app_list",
+		"get_group_list",
+		"get_machine_room_list",
+	}
 
-	async_actions = []string{"watch", "watch_children", "watch_config"}
-)*/
+	async_actions = []string{
+		"watch",
+		"watch_children",
+		"watch_config",
+	}
+)
 
 var (
 	// ErrRadarServerLost shows the connection lost err
@@ -45,7 +63,7 @@ const (
 type AppStatus uint8
 
 const (
-	// WuKai defined in C/S trans protocol that, ok == 0, else == 1
+	// defined in radar server C/S transport protocol, ok == 0, else == 1
 
 	// AppStatusRunning shows the app is running
 	AppStatusRunning AppStatus = 0
@@ -64,8 +82,31 @@ func (s AppStatus) String() string {
 	return status2str[s]
 }
 
-// StatusReq is the request args which user should pass into client API
-type StatusReq struct {
+// AppControl represent the state of an app whether is enabled
+type AppControl uint8
+
+const (
+	// defined in radar server C/S transport protocol, ok == 0, else == 1
+
+	// AppDisabled shows the app is disabled
+	AppDisabled AppControl = 0
+
+	// AppEnabled shows the app is enabled
+	AppEnabled AppControl = 1
+)
+
+var control2str = map[AppControl]string{
+	AppDisabled: "disabled",
+	AppEnabled:  "enabled",
+}
+
+// String return the string of app status
+func (s AppControl) String() string {
+	return control2str[s]
+}
+
+// ReqArgs is the common request args which is set into client API
+type ReqArgs struct {
 	DomainMoid   string `json:"domain_moid"`
 	ResourceMoid string `json:"resource_moid"`
 	GroupMoid    string `json:"group_moid"`
@@ -73,11 +114,22 @@ type StatusReq struct {
 	ServerName   string `json:"server_name"`
 }
 
-// StatusRsp is the reply of client API which request app status
-type StatusRsp struct {
+type RspComm struct {
 	ServerMoid string
 	ServerName string
-	Status     AppStatus
+}
+
+// StatusRsp is used by GetAppStatus()
+type StatusRsp struct {
+	RspComm
+	Status AppStatus
+}
+
+//
+// ControlRsp is used by GetAppControl()
+type ControlRsp struct {
+	RspComm
+	Control AppControl
 }
 
 // EventReq is the event which happened
@@ -128,6 +180,8 @@ const (
 	heartbeatMethod      protoMethod = 0
 	getAppStatusMethod   protoMethod = 1
 	watchAppStatusMethod protoMethod = 2
+	getAppControlMethod  protoMethod = 3
+	setAppControlMethod  protoMethod = 4
 
 	// TODO: add more
 )
@@ -170,6 +224,10 @@ func (d *pdata) decode(data []byte) (*pdata, error) {
 		d.pm = getAppStatusMethod
 	case "watch":
 		d.pm = watchAppStatusMethod
+	case "get_app_control":
+		d.pm = getAppControlMethod
+	case "set_app_control":
+		d.pm = setAppControlMethod
 	}
 
 	d.data = v
@@ -186,18 +244,29 @@ func heartBeatData(token string) pdata {
 	}
 }
 
-func getAppStatusData(token string, args []StatusReq) pdata {
+func getAppControlData(token string, args []ReqArgs) pdata {
+	return pdata{
+		pm: getAppControlMethod,
+		data: map[string]interface{}{
+			"key":    token,
+			"action": "get_app_control",
+			"args":   map[string][]ReqArgs{"servers": args},
+		},
+	}
+}
+
+func getAppStatusData(token string, args []ReqArgs) pdata {
 	return pdata{
 		pm: getAppStatusMethod,
 		data: map[string]interface{}{
 			"key":    token,
 			"action": "get_app_status",
-			"args":   map[string][]StatusReq{"servers": args},
+			"args":   map[string][]ReqArgs{"servers": args},
 		},
 	}
 }
 
-func watchAppStatusData(token string, args StatusReq) pdata {
+func watchAppStatusData(token string, args ReqArgs) pdata {
 	return pdata{
 		pm: watchAppStatusMethod,
 		data: map[string]interface{}{
@@ -445,9 +514,9 @@ func (rc *RadarClient) unregTransaction(t *transaction) {
 	rc.smap.Delete(t.token)
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// USER APIs
-/////////////////////////////////////////////////////////////////////////////
+// ###############
+//   General API
+// ###############
 
 // NewRadarClient returns a instance of radar client
 func NewRadarClient(host string, logger *logrus.Logger) *RadarClient {
@@ -516,8 +585,151 @@ func (rc *RadarClient) Version() string {
 	return fmt.Sprintf("version %s %s", VERSION, DATE)
 }
 
+// #############################
+//   User sync/async RPC API
+// #############################
+
+func (rc *RadarClient) prepare() (error, string) {
+	if !rc.Connected() {
+		return ErrRadarServerLost, ""
+	}
+
+	if rc.stopped {
+		return ErrRadarClientStopped, ""
+	}
+
+	var tokenTemp string
+	for {
+		tokenTemp = randStrGenerator()
+		if _, ok := rc.smap.Load(tokenTemp); ok {
+			continue
+		}
+		break
+	}
+	return nil, tokenTemp
+}
+
+// GetAppControl returns the app control state
+func (rc *RadarClient) GetAppControl(args []ReqArgs) ([]ControlRsp, error) {
+
+	err, tk := rc.prepare()
+	if err != nil {
+		return nil, err
+	}
+
+	var t = &transaction{}
+	t.token = tk
+	t.sendData = getAppControlData(t.token, args)
+	t.recvDataC = make(chan pdata)
+
+	rc.regTransaction(t)
+	defer rc.unregTransaction(t)
+
+	//err = rc.send(t)
+	if err = rc.send(t); err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Result struct {
+			Data []struct {
+				Moid    string
+				Name    string
+				Control int
+			}
+		}
+	}
+
+	var reply []ControlRsp
+	select {
+	case d := <-t.recvDataC:
+		// start to parse reply data from server
+		// checkout protocol.md
+		err = mapstructure.Decode(d.data, &result)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, r := range result.Result.Data {
+			var c AppControl
+
+			switch r.Control {
+			case 0:
+				c = AppDisabled
+			case 1:
+				c = AppEnabled
+			default:
+				return reply, fmt.Errorf("cannot parse status: %v", r)
+			}
+
+			reply = append(reply, ControlRsp{
+				RspComm: RspComm{
+					ServerMoid: r.Moid,
+					ServerName: r.Name,
+				},
+				Control: c,
+			})
+		}
+
+		return reply, nil
+
+	case <-rc.stopCh:
+		return nil, ErrRadarClientStopped
+
+	case <-rc.disconnectedCh:
+		return nil, ErrRadarServerLost
+	}
+}
+
+// FIXME: 是否需要将 map 的 interface 直接改成 string
+func setAppControlData(token string, op, dm, rm, gm, sn, sm string) pdata {
+	return pdata{
+		pm: setAppControlMethod,
+		data: map[string]interface{}{
+			"key":    token,
+			"action": "set_app_control",
+			"args": map[string]interface{}{
+				"operation":     op,
+				"domain_moid":   dm,
+				"resource_moid": rm,
+				"group_moid":    gm,
+				"server_name":   sn,
+				"server_moid":   sm,
+			},
+		},
+	}
+}
+
+// NOTE: resourceMoid is equal to machineRoomMoid
+// SetAppControl
+func (rc *RadarClient) SetAppControl(operation, domainMoid, resourceMoid, groupMoid, serverMoid, serverName string) (bool, error) {
+	return false, nil
+}
+
+/*
+
+   def set_app_control(self, operation, domain_moid, resource_moid=None, group_moid=None, server_name=None,server_moid=None):
+       data_dict = dict(
+           action='set_app_control',
+           args=dict(
+               operation=operation.value,
+               domain_moid=domain_moid,
+               resource_moid=resource_moid,
+               group_moid=group_moid,
+               server_name=server_name,
+               server_moid=server_moid,
+           ),
+       )
+       result_dict = self._handle_send_sync(data_dict)
+       if result_dict['result']['status'] == 0:
+           return (True, None) if result_dict['result']['data'] == 'Success' else (False, None)
+       else:
+           return False, result_dict['result']['status']
+
+*/
+
 // GetAppStatus returns the app status
-func (rc *RadarClient) GetAppStatus(args []StatusReq) ([]StatusRsp, error) {
+func (rc *RadarClient) GetAppStatus(args []ReqArgs) ([]StatusRsp, error) {
 	if !rc.Connected() {
 		return nil, ErrRadarServerLost
 	}
@@ -580,7 +792,13 @@ func (rc *RadarClient) GetAppStatus(args []StatusReq) ([]StatusRsp, error) {
 				return reply, fmt.Errorf("cannot parse status: %v", r)
 			}
 
-			reply = append(reply, StatusRsp{ServerMoid: r.Moid, ServerName: r.Name, Status: s})
+			reply = append(reply, StatusRsp{
+				RspComm: RspComm{
+					ServerMoid: r.Moid,
+					ServerName: r.Name,
+				},
+				Status: s,
+			})
 		}
 
 		return reply, nil
@@ -594,7 +812,7 @@ func (rc *RadarClient) GetAppStatus(args []StatusReq) ([]StatusRsp, error) {
 }
 
 // WatchAppStatus watches the specific app status
-func (rc *RadarClient) WatchAppStatus(args StatusReq, cb func(rpl EventRsp, err error)) error {
+func (rc *RadarClient) WatchAppStatus(args ReqArgs, cb func(rpl EventRsp, err error)) error {
 	if !rc.Connected() {
 		return ErrRadarServerLost
 	}
