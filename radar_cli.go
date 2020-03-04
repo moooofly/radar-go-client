@@ -55,9 +55,9 @@ const (
 	dialTimeout        = 5        // dial radar server timeout
 )
 
-/////////////////////////////////////////////////////////////
+// ###############################
 // App status and event
-/////////////////////////////////////////////////////////////
+// ###############################
 
 // AppStatus represent the status of an app
 type AppStatus uint8
@@ -160,7 +160,7 @@ type EventRsp struct {
 	data  interface{}
 }
 
-// mark one-time interaction
+// define one-time interaction
 type transaction struct {
 	token    string // unique random string used in sync.Map as key
 	sendData pdata
@@ -170,9 +170,10 @@ type transaction struct {
 	recvDataC chan pdata
 }
 
-/////////////////////////////////////////////////////////////
+// ###############################
 // Protocol definition
-/////////////////////////////////////////////////////////////
+// ###############################
+
 type protoMethod uint
 
 // TODO: 协议扩展位置
@@ -232,55 +233,6 @@ func (d *pdata) decode(data []byte) (*pdata, error) {
 
 	d.data = v
 	return d, nil
-}
-
-func heartBeatData(token string) pdata {
-	return pdata{
-		pm: heartbeatMethod,
-		data: map[string]interface{}{
-			"key":    token,
-			"action": "heart_beat",
-		},
-	}
-}
-
-func getAppControlData(token string, args []ReqArgs) pdata {
-	return pdata{
-		pm: getAppControlMethod,
-		data: map[string]interface{}{
-			"key":    token,
-			"action": "get_app_control",
-			"args":   map[string][]ReqArgs{"servers": args},
-		},
-	}
-}
-
-func getAppStatusData(token string, args []ReqArgs) pdata {
-	return pdata{
-		pm: getAppStatusMethod,
-		data: map[string]interface{}{
-			"key":    token,
-			"action": "get_app_status",
-			"args":   map[string][]ReqArgs{"servers": args},
-		},
-	}
-}
-
-func watchAppStatusData(token string, args ReqArgs) pdata {
-	return pdata{
-		pm: watchAppStatusMethod,
-		data: map[string]interface{}{
-			"key":    token,
-			"action": "watch",
-			"args": map[string]string{
-				"domain_moid":   args.DomainMoid,
-				"resource_moid": args.ResourceMoid,
-				"group_moid":    args.GroupMoid,
-				"server_moid":   args.ServerName + "_" + args.ServerMoid,
-				"node":          "status",
-			},
-		},
-	}
 }
 
 // RadarClient represent a radar client
@@ -401,59 +353,6 @@ func (rc *RadarClient) handleData(data []byte) {
 
 		if v, ok := rc.smap.Load(token); ok {
 			v.(*transaction).recvDataC <- pdata
-		}
-	}
-}
-
-func (rc *RadarClient) sendHeartbeat() error {
-	var t = &transaction{}
-
-	t.token = randStrGenerator()
-	t.sendData = heartBeatData(t.token)
-
-	// NOTE: fd, 20181227
-	// skip init the transaction's err channel, cuz it would not be used
-	// t.c = make(chan error)
-	return rc.send(t)
-}
-
-func (rc *RadarClient) healthCheck() {
-	// FIXME: really needed?
-	if err := rc.sendHeartbeat(); err != nil {
-		rc.logger.Errorf("[radar-client] heartbeat send failed: %v", err)
-	}
-
-	ticker := time.NewTicker(heartbeatInterval * time.Second)
-
-	for {
-		select {
-		case <-rc.stopCh:
-			rc.logger.Infof("[radar-client] client stopped, stop sending heartbeat")
-			return
-
-		case <-ticker.C:
-			select {
-			case <-rc.disconnectedCh:
-				return
-			default:
-				if err := rc.sendHeartbeat(); err != nil {
-					rc.logger.Errorf("[radar-client] heartbeat send failed: %v", err)
-				}
-			}
-
-		case <-rc.radarLostTimer.C:
-			// NOTE:
-			// 1. signal the state of disconnection
-			// 2. update connection status
-			// 3. close connection to make sure sync i/o function `read/send' failed
-			select {
-			case <-rc.disconnectedCh:
-				return
-			default:
-				close(rc.disconnectedCh)
-				rc.updateConnStatus(false, "healthcheck timeout")
-				rc.closeConn("healthcheck timeout")
-			}
 		}
 	}
 }
@@ -586,6 +485,73 @@ func (rc *RadarClient) Version() string {
 }
 
 // #############################
+//   protocol interaction
+// #############################
+
+func heartBeatData(token string) pdata {
+	return pdata{
+		pm: heartbeatMethod,
+		data: map[string]interface{}{
+			"key":    token,
+			"action": "heart_beat",
+		},
+	}
+}
+
+func (rc *RadarClient) sendHeartbeat() error {
+	var t = &transaction{}
+
+	t.token = randStrGenerator()
+	t.sendData = heartBeatData(t.token)
+
+	// NOTE: fd, 20181227
+	// skip init the transaction's err channel, cuz it would not be used
+	// t.c = make(chan error)
+	return rc.send(t)
+}
+
+func (rc *RadarClient) healthCheck() {
+	// FIXME: really needed?
+	if err := rc.sendHeartbeat(); err != nil {
+		rc.logger.Errorf("[radar-client] heartbeat send failed: %v", err)
+	}
+
+	ticker := time.NewTicker(heartbeatInterval * time.Second)
+
+	for {
+		select {
+		case <-rc.stopCh:
+			rc.logger.Infof("[radar-client] client stopped, stop sending heartbeat")
+			return
+
+		case <-ticker.C:
+			select {
+			case <-rc.disconnectedCh:
+				return
+			default:
+				if err := rc.sendHeartbeat(); err != nil {
+					rc.logger.Errorf("[radar-client] heartbeat send failed: %v", err)
+				}
+			}
+
+		case <-rc.radarLostTimer.C:
+			// NOTE:
+			// 1. signal the state of disconnection
+			// 2. update connection status
+			// 3. close connection to make sure sync i/o function `read/send' failed
+			select {
+			case <-rc.disconnectedCh:
+				return
+			default:
+				close(rc.disconnectedCh)
+				rc.updateConnStatus(false, "healthcheck timeout")
+				rc.closeConn("healthcheck timeout")
+			}
+		}
+	}
+}
+
+// #############################
 //   User sync/async RPC API
 // #############################
 
@@ -609,6 +575,27 @@ func (rc *RadarClient) prepare() (error, string) {
 	return nil, tokenTemp
 }
 
+func getAppControlData(token string, args []ReqArgs) pdata {
+	return pdata{
+		pm: getAppControlMethod,
+		data: map[string]interface{}{
+			"key":    token,
+			"action": "get_app_control",
+			"args":   map[string][]ReqArgs{"servers": args},
+		},
+	}
+}
+
+var GetAppControlRsp struct {
+	Result struct {
+		Data []struct {
+			Moid    string
+			Name    string
+			Control int
+		}
+	}
+}
+
 // GetAppControl returns the app control state
 func (rc *RadarClient) GetAppControl(args []ReqArgs) ([]ControlRsp, error) {
 
@@ -625,32 +612,20 @@ func (rc *RadarClient) GetAppControl(args []ReqArgs) ([]ControlRsp, error) {
 	rc.regTransaction(t)
 	defer rc.unregTransaction(t)
 
-	//err = rc.send(t)
 	if err = rc.send(t); err != nil {
 		return nil, err
-	}
-
-	var result struct {
-		Result struct {
-			Data []struct {
-				Moid    string
-				Name    string
-				Control int
-			}
-		}
 	}
 
 	var reply []ControlRsp
 	select {
 	case d := <-t.recvDataC:
-		// start to parse reply data from server
-		// checkout protocol.md
-		err = mapstructure.Decode(d.data, &result)
+		// start to parse reply data from server checkout protocol.md
+		err = mapstructure.Decode(d.data, &GetAppControlRsp)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, r := range result.Result.Data {
+		for _, r := range GetAppControlRsp.Result.Data {
 			var c AppControl
 
 			switch r.Control {
@@ -682,7 +657,7 @@ func (rc *RadarClient) GetAppControl(args []ReqArgs) ([]ControlRsp, error) {
 }
 
 // FIXME: 是否需要将 map 的 interface 直接改成 string
-func setAppControlData(token string, op, dm, rm, gm, sn, sm string) pdata {
+func setAppControlData(token string, op, dm, rm, gm, sm, sn string) pdata {
 	return pdata{
 		pm: setAppControlMethod,
 		data: map[string]interface{}{
@@ -693,94 +668,111 @@ func setAppControlData(token string, op, dm, rm, gm, sn, sm string) pdata {
 				"domain_moid":   dm,
 				"resource_moid": rm,
 				"group_moid":    gm,
-				"server_name":   sn,
 				"server_moid":   sm,
+				"server_name":   sn,
 			},
 		},
+	}
+}
+
+var setAppControlRsp struct {
+	Result struct {
+		Data string
 	}
 }
 
 // NOTE: resourceMoid is equal to machineRoomMoid
 // SetAppControl
 func (rc *RadarClient) SetAppControl(operation, domainMoid, resourceMoid, groupMoid, serverMoid, serverName string) (bool, error) {
-	return false, nil
-}
-
-/*
-
-   def set_app_control(self, operation, domain_moid, resource_moid=None, group_moid=None, server_name=None,server_moid=None):
-       data_dict = dict(
-           action='set_app_control',
-           args=dict(
-               operation=operation.value,
-               domain_moid=domain_moid,
-               resource_moid=resource_moid,
-               group_moid=group_moid,
-               server_name=server_name,
-               server_moid=server_moid,
-           ),
-       )
-       result_dict = self._handle_send_sync(data_dict)
-       if result_dict['result']['status'] == 0:
-           return (True, None) if result_dict['result']['data'] == 'Success' else (False, None)
-       else:
-           return False, result_dict['result']['status']
-
-*/
-
-// GetAppStatus returns the app status
-func (rc *RadarClient) GetAppStatus(args []ReqArgs) ([]StatusRsp, error) {
-	if !rc.Connected() {
-		return nil, ErrRadarServerLost
-	}
-
-	if rc.stopped {
-		return nil, ErrRadarClientStopped
+	err, tk := rc.prepare()
+	if err != nil {
+		return false, err
 	}
 
 	var t = &transaction{}
-	var reply []StatusRsp
-	var result struct {
-		Result struct {
-			Data []struct {
-				Moid   string
-				Status int
-				Name   string
-			}
-		}
+	t.token = tk
+	t.sendData = setAppControlData(t.token, operation, domainMoid, resourceMoid, groupMoid, serverMoid, serverName)
+	t.recvDataC = make(chan pdata)
+
+	rc.regTransaction(t)
+	defer rc.unregTransaction(t)
+
+	if err = rc.send(t); err != nil {
+		return false, err
 	}
 
-	var tokenTemp string
-	for {
-		tokenTemp = randStrGenerator()
-		if _, ok := rc.smap.Load(tokenTemp); ok {
-			continue
+	select {
+	case d := <-t.recvDataC:
+		err = mapstructure.Decode(d.data, &setAppControlRsp)
+		if err != nil {
+			return false, err
 		}
-		break
+
+		// NOTE: Data can only be "Success" or "Failed"
+		if setAppControlRsp.Result.Data == "Success" {
+			return true, nil
+		} else {
+			return false, nil
+		}
+
+	case <-rc.stopCh:
+		return false, ErrRadarClientStopped
+
+	case <-rc.disconnectedCh:
+		return false, ErrRadarServerLost
 	}
-	t.token = tokenTemp
+}
+
+func getAppStatusData(token string, args []ReqArgs) pdata {
+	return pdata{
+		pm: getAppStatusMethod,
+		data: map[string]interface{}{
+			"key":    token,
+			"action": "get_app_status",
+			"args":   map[string][]ReqArgs{"servers": args},
+		},
+	}
+}
+
+var GetAppStatusRsp struct {
+	Result struct {
+		Data []struct {
+			Moid   string
+			Status int
+			Name   string
+		}
+	}
+}
+
+// GetAppStatus returns the app status
+func (rc *RadarClient) GetAppStatus(args []ReqArgs) ([]StatusRsp, error) {
+
+	err, tk := rc.prepare()
+	if err != nil {
+		return nil, err
+	}
+
+	var t = &transaction{}
+	t.token = tk
 	t.sendData = getAppStatusData(t.token, args)
 	t.recvDataC = make(chan pdata)
 
 	rc.regTransaction(t)
 	defer rc.unregTransaction(t)
 
-	err := rc.send(t)
-	if err != nil {
+	if err := rc.send(t); err != nil {
 		return nil, err
 	}
 
-	// wait for the reply
+	var reply []StatusRsp
 	select {
 	case d := <-t.recvDataC:
-		// start to parse reply data from server
-		// checkout protocol.md
-		err = mapstructure.Decode(d.data, &result)
+		err = mapstructure.Decode(d.data, &GetAppStatusRsp)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, r := range result.Result.Data {
+		for _, r := range GetAppStatusRsp.Result.Data {
 			var s AppStatus
 
 			switch r.Status {
@@ -811,33 +803,39 @@ func (rc *RadarClient) GetAppStatus(args []ReqArgs) ([]StatusRsp, error) {
 	}
 }
 
+func watchAppStatusData(token string, args ReqArgs) pdata {
+	return pdata{
+		pm: watchAppStatusMethod,
+		data: map[string]interface{}{
+			"key":    token,
+			"action": "watch",
+			"args": map[string]string{
+				"domain_moid":   args.DomainMoid,
+				"resource_moid": args.ResourceMoid,
+				"group_moid":    args.GroupMoid,
+				"server_moid":   args.ServerName + "_" + args.ServerMoid,
+				"node":          "status",
+			},
+		},
+	}
+}
+
 // WatchAppStatus watches the specific app status
 func (rc *RadarClient) WatchAppStatus(args ReqArgs, cb func(rpl EventRsp, err error)) error {
-	if !rc.Connected() {
-		return ErrRadarServerLost
-	}
 
-	if rc.stopped {
-		return ErrRadarClientStopped
+	err, tk := rc.prepare()
+	if err != nil {
+		return err
 	}
 
 	var t = &transaction{}
-	var tokenTemp string
-	for {
-		tokenTemp = randStrGenerator()
-		if _, ok := rc.smap.Load(tokenTemp); ok {
-			continue
-		}
-		break
-	}
-	t.token = tokenTemp
+	t.token = tk
 	t.sendData = watchAppStatusData(t.token, args)
 	t.recvDataC = make(chan pdata)
 
 	rc.regTransaction(t)
 
-	err := rc.send(t)
-	if err != nil {
+	if err := rc.send(t); err != nil {
 		return err
 	}
 
@@ -848,6 +846,7 @@ func (rc *RadarClient) WatchAppStatus(args ReqArgs, cb func(rpl EventRsp, err er
 		for !rc.stopped {
 			var rpl EventRsp
 			var err error
+
 			var result struct {
 				Result struct {
 					Status int
@@ -857,8 +856,6 @@ func (rc *RadarClient) WatchAppStatus(args ReqArgs, cb func(rpl EventRsp, err er
 
 			select {
 			case d := <-t.recvDataC:
-				// start to parse reply data from server
-				// checkout protocol.md
 				err = mapstructure.Decode(d.data, &result)
 				if err != nil {
 					cb(rpl, err)
