@@ -1,3 +1,9 @@
+## 0.2.0 (2020-04-30)
+
+* feat: fix bug on struct reuse and optimize log output ([288a1b5](https://github.com/moooofly/radar-go-client/commit/288a1b5))
+
+
+
 ## 0.1.0 (2020-04-17)
 
 * refactor: refactor codes for better understanding ([d99e455](https://github.com/moooofly/radar-go-client/commit/d99e455))
