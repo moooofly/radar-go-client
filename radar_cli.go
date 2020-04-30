@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -237,7 +238,9 @@ func (d *pdata) decode(data []byte) (*pdata, error) {
 
 // RadarClient represent a radar client
 type RadarClient struct {
-	host   string
+	ip   string
+	port string
+
 	client net.Conn
 
 	connected      bool // connection state of radar server
@@ -268,7 +271,7 @@ func (rc *RadarClient) send(t *transaction) error {
 	bytes = append(bytes, intToBytes(cnt)...)
 	bytes = append(bytes, b...)
 
-	rc.logger.Debugf("[radar-client] send => %s", bytes)
+	//rc.logger.Debugf("[radar-client] send => %s", bytes)
 	rc.client.SetWriteDeadline(time.Now().Add(radarServerTimeout * time.Second))
 	_, err = rc.client.Write(bytes)
 	if err != nil {
@@ -291,7 +294,7 @@ func (rc *RadarClient) receive() {
 		rc.client.SetReadDeadline(time.Now().Add(radarServerTimeout * time.Second))
 		n, err := rc.client.Read(buf)
 		if err != nil {
-			rc.logger.Errorf("[radar-client] receive failed: %v", err)
+			rc.logger.Warnf("[radar-client] receive failed: %v", err)
 			if err == io.EOF {
 				select {
 				case <-rc.disconnectedCh:
@@ -307,7 +310,7 @@ func (rc *RadarClient) receive() {
 			continue
 		}
 
-		rc.logger.Debugf("[radar-client] recv <= %s", buf[:n])
+		//rc.logger.Debugf("[radar-client] recv <= %s", buf[:n])
 		raw = append(raw, buf[:n]...)
 
 		for len(raw) > hdrSize {
@@ -371,7 +374,7 @@ func (rc *RadarClient) disconnect(reason string) {
 
 	close(rc.stopCh)
 
-	rc.logger.Infof("[radar-client] connection to radar is [DOWN] (reason: '%s')", reason)
+	rc.logger.Warnf("[radar-client] connection to radar is [DOWN] (reason: '%s')", reason)
 }
 
 func (rc *RadarClient) updateConnStatus(stat bool, reason string) {
@@ -397,7 +400,7 @@ func (rc *RadarClient) updateConnStatus(stat bool, reason string) {
 }
 
 func (rc *RadarClient) closeConn(reason string) error {
-	rc.logger.Debugf("[radar-client] shutdown radar connection locally, as of '%s'", reason)
+	rc.logger.Warnf("[radar-client] shutdown radar connection locally, as of '%s'", reason)
 
 	if rc.client != nil {
 		return rc.client.Close()
@@ -418,9 +421,10 @@ func (rc *RadarClient) unregTransaction(t *transaction) {
 // ###############
 
 // NewRadarClient returns a instance of radar client
-func NewRadarClient(host string, logger *logrus.Logger) *RadarClient {
+func NewRadarClient(ip, port string, logger *logrus.Logger) *RadarClient {
 	return &RadarClient{
-		host:   host,
+		ip:     ip,
+		port:   port,
 		logger: logger,
 	}
 }
@@ -434,9 +438,15 @@ func (rc *RadarClient) Connect() error {
 	rc.connectedCh = make(chan struct{})
 	rc.disconnectedCh = make(chan struct{})
 
-	c, err := net.DialTimeout("tcp", rc.host, dialTimeout*time.Second)
+	var addr string
+	if strings.Contains(rc.ip, ":") {
+		addr = fmt.Sprintf("[%s]:%s", rc.ip, rc.port)
+	} else {
+		addr = fmt.Sprintf("%s:%s", rc.ip, rc.port)
+	}
+
+	c, err := net.DialTimeout("tcp", addr, dialTimeout*time.Second)
 	if err != nil {
-		rc.logger.Errorf("[radar-client] error when connecting: %v", err)
 		return err
 	}
 
@@ -586,18 +596,14 @@ func getAppControlData(token string, args []ReqArgs) pdata {
 	}
 }
 
-var GetAppControlRsp struct {
-	Result struct {
-		Data []struct {
-			Moid    string
-			Name    string
-			Control int
-		}
-	}
-}
-
 // GetAppControl returns the app control state
 func (rc *RadarClient) GetAppControl(args []ReqArgs) ([]ControlRsp, error) {
+
+	/*
+		rc.logger.Debugf("[radar-client] [[ GetAppControl ]] -- args --")
+		rc.logger.Debugf("[radar-client] [[ GetAppControl ]] %v", args)
+		rc.logger.Debugf("[radar-client] [[ GetAppControl ]] -- args --")
+	*/
 
 	err, tk := rc.prepare()
 	if err != nil {
@@ -616,22 +622,45 @@ func (rc *RadarClient) GetAppControl(args []ReqArgs) ([]ControlRsp, error) {
 		return nil, err
 	}
 
+	var GetAppControlRsp struct {
+		Result struct {
+			Data []struct {
+				Moid    string
+				Name    string
+				Control string
+			}
+		}
+	}
+
 	var reply []ControlRsp
 	select {
 	case d := <-t.recvDataC:
+
+		/*
+			rc.logger.Debugf("[radar-client] [[ GetAppControl ]] -- d.data --")
+			rc.logger.Debugf("[radar-client] [[ GetAppControl ]] %v", d.data)
+			rc.logger.Debugf("[radar-client] [[ GetAppControl ]] -- d.data --")
+		*/
+
 		// start to parse reply data from server checkout protocol.md
 		err = mapstructure.Decode(d.data, &GetAppControlRsp)
 		if err != nil {
 			return nil, err
 		}
 
+		/*
+			rc.logger.Debugf("[radar-client] [[ GetAppControl ]] -- GetAppControlRsp --")
+			rc.logger.Debugf("[radar-client] [[ GetAppControl ]] %v", GetAppControlRsp)
+			rc.logger.Debugf("[radar-client] [[ GetAppControl ]] -- GetAppControlRsp --")
+		*/
+
 		for _, r := range GetAppControlRsp.Result.Data {
 			var c AppControl
 
 			switch r.Control {
-			case 0:
+			case "0":
 				c = AppDisabled
-			case 1:
+			case "1":
 				c = AppEnabled
 			default:
 				return reply, fmt.Errorf("cannot parse status: %v", r)
@@ -675,15 +704,21 @@ func setAppControlData(token string, op, dm, rm, gm, sm, sn string) pdata {
 	}
 }
 
-var setAppControlRsp struct {
-	Result struct {
-		Data string
-	}
-}
-
 // NOTE: resourceMoid is equal to machineRoomMoid
 // SetAppControl
 func (rc *RadarClient) SetAppControl(operation, domainMoid, resourceMoid, groupMoid, serverMoid, serverName string) (bool, error) {
+
+	/*
+		rc.logger.Debugf("[radar-client] [[ SetAppControl ]] -- args --")
+		rc.logger.Debugf("[radar-client] [[ SetAppControl ]] operation   : %v", operation)
+		rc.logger.Debugf("[radar-client] [[ SetAppControl ]] domainMoid  : %v", domainMoid)
+		rc.logger.Debugf("[radar-client] [[ SetAppControl ]] resourceMoid: %v", resourceMoid)
+		rc.logger.Debugf("[radar-client] [[ SetAppControl ]] groupMoid   : %v", groupMoid)
+		rc.logger.Debugf("[radar-client] [[ SetAppControl ]] serverMoid  : %v", serverMoid)
+		rc.logger.Debugf("[radar-client] [[ SetAppControl ]] serverName  : %v", serverName)
+		rc.logger.Debugf("[radar-client] [[ SetAppControl ]] -- args --")
+	*/
+
 	err, tk := rc.prepare()
 	if err != nil {
 		return false, err
@@ -701,12 +736,31 @@ func (rc *RadarClient) SetAppControl(operation, domainMoid, resourceMoid, groupM
 		return false, err
 	}
 
+	var setAppControlRsp struct {
+		Result struct {
+			Data string
+		}
+	}
+
 	select {
 	case d := <-t.recvDataC:
+
+		/*
+			rc.logger.Debugf("[radar-client] [[ SetAppControl ]] -- d.data --")
+			rc.logger.Debugf("[radar-client] [[ SetAppControl ]] %v", d.data)
+			rc.logger.Debugf("[radar-client] [[ SetAppControl ]] -- d.data --")
+		*/
+
 		err = mapstructure.Decode(d.data, &setAppControlRsp)
 		if err != nil {
 			return false, err
 		}
+
+		/*
+			rc.logger.Debugf("[radar-client] [[ SetAppControl ]] -- setAppControlRsp --")
+			rc.logger.Debugf("[radar-client] [[ SetAppControl ]] %v", setAppControlRsp)
+			rc.logger.Debugf("[radar-client] [[ SetAppControl ]] -- setAppControlRsp --")
+		*/
 
 		// NOTE: Data can only be "Success" or "Failed"
 		if setAppControlRsp.Result.Data == "Success" {
@@ -734,18 +788,14 @@ func getAppStatusData(token string, args []ReqArgs) pdata {
 	}
 }
 
-var GetAppStatusRsp struct {
-	Result struct {
-		Data []struct {
-			Moid   string
-			Status int
-			Name   string
-		}
-	}
-}
-
 // GetAppStatus returns the app status
 func (rc *RadarClient) GetAppStatus(args []ReqArgs) ([]StatusRsp, error) {
+
+	/*
+		rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] -- args --")
+		rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] %v", args)
+		rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] -- args --")
+	*/
 
 	err, tk := rc.prepare()
 	if err != nil {
@@ -764,13 +814,36 @@ func (rc *RadarClient) GetAppStatus(args []ReqArgs) ([]StatusRsp, error) {
 		return nil, err
 	}
 
+	var GetAppStatusRsp struct {
+		Result struct {
+			Data []struct {
+				Moid   string
+				Status int
+				Name   string
+			}
+		}
+	}
+
 	var reply []StatusRsp
 	select {
 	case d := <-t.recvDataC:
+
+		/*
+			rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] -- d.data --")
+			rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] %v", d.data)
+			rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] -- d.data --")
+		*/
+
 		err = mapstructure.Decode(d.data, &GetAppStatusRsp)
 		if err != nil {
 			return nil, err
 		}
+
+		/*
+			rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] -- GetAppStatusRsp --")
+			rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] %v", GetAppStatusRsp)
+			rc.logger.Debugf("[radar-client] [[ GetAppStatus ]] -- GetAppStatusRsp --")
+		*/
 
 		for _, r := range GetAppStatusRsp.Result.Data {
 			var s AppStatus
